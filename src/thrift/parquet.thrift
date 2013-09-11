@@ -176,7 +176,13 @@ struct DataPageHeader {
 }
 
 struct IndexPageHeader {
-  /** TODO: **/
+  /** The number of entries in this index page **/
+  1: required i32 num_entries
+
+  2: required bool is_ordinal_index
+  
+  /** Encoding used for values. Only used if it is not an ordinal index **/
+  2: optional Encoding encoding
 }
 
 struct DictionaryPageHeader {

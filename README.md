@@ -248,6 +248,89 @@ header and readers can skip over page they are not interested in.  The data for 
 page follows the header and can be compressed and/or encoded.  The compression and 
 encoding is specified in the page metadata.
 
+## Index Pages
+If the parquet data is sorted, we can optionally support having an index on the first
+sort column. The sorting column will contain an index on the values. The non-sort columns
+will contain an index on the ordinal (i.e. row number). Note: both indices are per
+row group only. The index pages and data pages form a tree that is interleaved in the
+file. All leaf nodes are data pages.
+
+Conceptually, each entry in an index page looks like:
+
+    struct IndexEntry {
+       <type> min_value;
+       int32 page_offset;
+       int32 page_len;
+    }
+
+All the entries in a page are sorted by value. For example, if we had 3 entries:
+{100, 0, 64K}, {500, 64K, 64K} {502, 128K, 64K}
+
+We'd know all values <= 100 are in page at offset 0; [100, 500] are in the page at offset 
+64K; [500, 502] are in the page at offset 128K and there are no values greater than 502. 
+The pages at the offsets could in turn be index pages and we simply recurse. Note: we need
+inclusive intervals on non-ordinal indices since our keys do not have to be unique.
+
+Since the entries are sorted, we can binary search to get at the target entry. However, 
+the struct as defined above is not fixed size (due to min_value) making binary search 
+very difficult. Instead, the IndexEntry will contain a byte offset to a values payload. 
+The index entry looks like:
+
+    struct IndexEntry {
+      union {
+        int32 min_value_byte_offset;
+        int32 min_ordinal;
+      }
+      int32 page_offset;
+      int32 page_len;
+    }
+
+    struct IndexPage {
+       IndexEntry[] entries;
+       byte[] values_buffer;
+    }
+
+where values_buffer[entries[0].min_value_byte_offset] is the key for the first entry.
+
+For ordinal pages (where the key is just the row count), the values buffer is empty and 
+for the key, we simply use min_ordinal.
+
+### Disk Format
+The on disk format for the data page is exactly the above serialized as little endian. 
+All the entries are written back to back (the index header has the number of entries). 
+If it is an non-ordinal index, the values_buffer is written with the encoding specified 
+in the page header (note: this encoding needs to support random access so only PLAIN is 
+currently supported).
+
+### Read Path
+As an example, consider the simplest case of reading an entire row for a single unique 
+key value. The reader starts by reading the root index page for the key column. From the 
+index page, the reader finds the entry for this key which tells it the next page to read. 
+This continues recursively until the page is a data page. The reader then reads the data 
+page for the key and finds the row id (in this row group) for that key. The reader now 
+knows that it is looking for row N (e.g. the 12345th row in this row group). With the row 
+id, the reader does the same index page traversal on the other columns by ordinal and 
+finds the other values for this row.
+
+In practice, instead of finding one ordinal, it would be a range of ordinals.
+
+### Write path
+The write path is relatively simple. The on disk layout would be an post order traversal 
+of the tree structure. For example, DataPage, DataPage, DataPage, IndexPage (for the 3 
+previous data pages), DataPage, DataPage, IndexPage (for the previous 2), 
+IndexPage(for the two index pages).
+
+### Index Page Size
+The more index pages there are (few entries per page), the more seeks we do on the read 
+path. The larger the entries, the more IO volume we do. We should have the index pages 
+also roll over at 64KB.
+In practice this leads to a very flat tree (unless the key is a long string column).
+
+With a key on a 8 byte int, the size per entry is (8 + 12 = 20 bytes). 64KB would support 
+~3200 entries. Each entry points to a 64KB data page so this would be a 204MB column. 
+Since this is just one column in the file, we expect this to be sufficient most of the 
+time.
+
 ## Checksumming
 Data pages can be individually checksummed.  This allows disabling of checksums at the 
 HDFS file level, to better support single row lookups.
